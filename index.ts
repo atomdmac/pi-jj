@@ -12,7 +12,19 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text, Container, Spacer } from "@mariozechner/pi-tui";
+import {
+  Text,
+  Container,
+  Spacer,
+  Box,
+  Input,
+  matchesKey,
+  Key,
+  truncateToWidth,
+  wrapTextWithAnsi,
+  type Component,
+  type Focusable,
+} from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 import {
@@ -41,6 +53,22 @@ import {
   type SubagentResult,
   type SubagentUsage,
 } from "./lib/subagent.js";
+import {
+  RpcClient,
+  getTextDelta,
+  isAgentEnd,
+  isAgentStart,
+  formatToolEvent,
+  type RpcEvent,
+  type ExtensionUiRequestEvent,
+} from "./lib/rpc-client.js";
+import {
+  SessionWatcher,
+  findWorkspaceSessionFiles,
+  formatSessionEntry,
+  getSessionSummary,
+  type SessionEntry,
+} from "./lib/session-watcher.js";
 import { spawn } from "node:child_process";
 
 // Custom entry type for session persistence
@@ -50,6 +78,7 @@ interface WorkspaceEntry {
   workspace: WorkspaceInfo;
   result?: SubagentResult;
   lifecycleAction?: WorkspaceLifecycleAction;
+  lifecycleMessage?: string;
 }
 
 // Tool result details
@@ -58,6 +87,536 @@ interface JJWorkspaceDetails {
   result?: SubagentResult;
   lifecycleAction?: WorkspaceLifecycleAction;
   lifecycleMessage?: string;
+}
+
+/**
+ * Interactive RPC Session View Component
+ *
+ * Displays streaming output from a pi subprocess and allows sending prompts.
+ */
+class RpcSessionView implements Component, Focusable {
+  private outputLines: string[] = [];
+  private maxOutputLines = 500;
+  private status: "connecting" | "idle" | "running" | "error" | "closed" = "connecting";
+  private errorMessage?: string;
+  private currentTool?: string;
+  private scrollOffset = 0;
+  private cachedWidth?: number;
+  private cachedRender?: string[];
+
+  private input: Input;
+  private _focused = false;
+
+  public rpcClient?: RpcClient;
+  public workspaceName: string;
+  public workspacePath: string;
+  public onClose?: () => void;
+  public requestRenderFn?: () => void;
+
+  // Focusable implementation
+  get focused(): boolean {
+    return this._focused;
+  }
+  set focused(value: boolean) {
+    this._focused = value;
+    this.input.focused = value;
+  }
+
+  constructor(workspaceName: string, workspacePath: string) {
+    this.workspaceName = workspaceName;
+    this.workspacePath = workspacePath;
+    this.input = new Input();
+  }
+
+  appendOutput(text: string): void {
+    // Split text into lines and add to output
+    const lines = text.split("\n");
+    for (const line of lines) {
+      if (line || this.outputLines.length > 0) {
+        this.outputLines.push(line);
+      }
+    }
+
+    // Trim to max lines
+    while (this.outputLines.length > this.maxOutputLines) {
+      this.outputLines.shift();
+    }
+
+    // Auto-scroll to bottom
+    this.scrollOffset = 0;
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  setStatus(status: typeof this.status, error?: string): void {
+    this.status = status;
+    this.errorMessage = error;
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  setCurrentTool(tool?: string): void {
+    this.currentTool = tool;
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  handleInput(data: string): void {
+    // Handle escape to close
+    if (matchesKey(data, Key.escape)) {
+      this.onClose?.();
+      return;
+    }
+
+    // Handle Ctrl+C to abort
+    if (matchesKey(data, Key.ctrl("c"))) {
+      if (this.status === "running" && this.rpcClient) {
+        this.rpcClient.abort().catch(() => {});
+        this.appendOutput("\n[Aborting...]");
+      }
+      return;
+    }
+
+    // Handle scroll
+    if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("u"))) {
+      this.scrollOffset = Math.min(this.scrollOffset + 10, Math.max(0, this.outputLines.length - 5));
+      this.invalidate();
+      this.requestRenderFn?.();
+      return;
+    }
+    if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("d"))) {
+      this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+      this.invalidate();
+      this.requestRenderFn?.();
+      return;
+    }
+
+    // Handle enter to send prompt
+    if (matchesKey(data, Key.enter)) {
+      const text = this.input.getValue().trim();
+      if (text && this.status === "idle" && this.rpcClient) {
+        this.input.setValue("");
+        this.appendOutput(`\n> ${text}\n`);
+        this.setStatus("running");
+
+        this.rpcClient.prompt(text).then((response) => {
+          if (!response.success) {
+            this.appendOutput(`\n[Error: ${response.error}]\n`);
+            this.setStatus("idle");
+          }
+        }).catch((err) => {
+          this.appendOutput(`\n[Error: ${err.message}]\n`);
+          this.setStatus("idle");
+        });
+      }
+      return;
+    }
+
+    // Pass other input to the input component
+    this.input.handleInput?.(data);
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  render(width: number): string[] {
+    if (this.cachedWidth === width && this.cachedRender) {
+      return this.cachedRender;
+    }
+
+    const lines: string[] = [];
+
+    // Header
+    const statusIcon =
+      this.status === "connecting" ? "⏳" :
+      this.status === "running" ? "▶" :
+      this.status === "idle" ? "●" :
+      this.status === "error" ? "✗" : "○";
+
+    const statusText =
+      this.status === "connecting" ? "Connecting..." :
+      this.status === "running" ? (this.currentTool ? `Running (${this.currentTool})` : "Running...") :
+      this.status === "idle" ? "Ready" :
+      this.status === "error" ? `Error: ${this.errorMessage}` : "Closed";
+
+    const header = `${statusIcon} ${this.workspaceName} - ${statusText}`;
+    lines.push(truncateToWidth(`\x1b[1m${header}\x1b[0m`, width));
+    lines.push(truncateToWidth(`\x1b[2m${this.workspacePath}\x1b[0m`, width));
+    lines.push("─".repeat(Math.min(width, 80)));
+
+    // Calculate available height for output (reserve 4 lines for header + 3 for input/footer)
+    const outputHeight = 15; // Fixed height for output area
+
+    // Render output with scroll
+    const visibleStart = Math.max(0, this.outputLines.length - outputHeight - this.scrollOffset);
+    const visibleEnd = Math.min(this.outputLines.length, visibleStart + outputHeight);
+    const visibleLines = this.outputLines.slice(visibleStart, visibleEnd);
+
+    for (const line of visibleLines) {
+      // Wrap long lines
+      const wrapped = wrapTextWithAnsi(line, width);
+      for (const wl of wrapped) {
+        lines.push(truncateToWidth(wl, width));
+      }
+    }
+
+    // Pad to fixed height
+    while (lines.length < outputHeight + 3) {
+      lines.push("");
+    }
+
+    // Scroll indicator
+    if (this.outputLines.length > outputHeight) {
+      const scrollInfo = this.scrollOffset > 0
+        ? `[${this.scrollOffset} lines below, PgUp/PgDn to scroll]`
+        : `[${Math.max(0, this.outputLines.length - outputHeight)} lines above]`;
+      lines.push(truncateToWidth(`\x1b[2m${scrollInfo}\x1b[0m`, width));
+    } else {
+      lines.push("");
+    }
+
+    // Separator
+    lines.push("─".repeat(Math.min(width, 80)));
+
+    // Input area
+    const inputLines = this.input.render(width);
+    lines.push(...inputLines);
+
+    // Footer with keybindings
+    const footer = "\x1b[2mEnter: send | Ctrl+C: abort | Esc: close\x1b[0m";
+    lines.push(truncateToWidth(footer, width));
+
+    this.cachedWidth = width;
+    this.cachedRender = lines;
+    return lines;
+  }
+
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedRender = undefined;
+    this.input.invalidate();
+  }
+}
+
+/**
+ * Session Watcher View Component
+ *
+ * Displays streaming updates from a session file being watched.
+ */
+class SessionWatcherView implements Component {
+  private outputLines: string[] = [];
+  private maxOutputLines = 500;
+  private status: "watching" | "stopped" | "error" = "watching";
+  private errorMessage?: string;
+  private scrollOffset = 0;
+  private cachedWidth?: number;
+  private cachedRender?: string[];
+  private entryCount = 0;
+
+  public sessionFile: string;
+  public workspaceName: string;
+  public watcher?: SessionWatcher;
+  public onClose?: () => void;
+  public requestRenderFn?: () => void;
+
+  constructor(workspaceName: string, sessionFile: string) {
+    this.workspaceName = workspaceName;
+    this.sessionFile = sessionFile;
+  }
+
+  appendOutput(text: string): void {
+    const lines = text.split("\n");
+    for (const line of lines) {
+      if (line || this.outputLines.length > 0) {
+        this.outputLines.push(line);
+      }
+    }
+
+    while (this.outputLines.length > this.maxOutputLines) {
+      this.outputLines.shift();
+    }
+
+    this.scrollOffset = 0;
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  incrementEntryCount(): void {
+    this.entryCount++;
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  setStatus(status: typeof this.status, error?: string): void {
+    this.status = status;
+    this.errorMessage = error;
+    this.invalidate();
+    this.requestRenderFn?.();
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
+      this.onClose?.();
+      return;
+    }
+
+    if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("u"))) {
+      this.scrollOffset = Math.min(this.scrollOffset + 10, Math.max(0, this.outputLines.length - 5));
+      this.invalidate();
+      this.requestRenderFn?.();
+      return;
+    }
+    if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("d"))) {
+      this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+      this.invalidate();
+      this.requestRenderFn?.();
+      return;
+    }
+  }
+
+  render(width: number): string[] {
+    if (this.cachedWidth === width && this.cachedRender) {
+      return this.cachedRender;
+    }
+
+    const lines: string[] = [];
+
+    const statusIcon =
+      this.status === "watching" ? "👁" :
+      this.status === "error" ? "✗" : "○";
+
+    const statusText =
+      this.status === "watching" ? `Watching (${this.entryCount} entries)` :
+      this.status === "error" ? `Error: ${this.errorMessage}` : "Stopped";
+
+    const header = `${statusIcon} ${this.workspaceName} - ${statusText}`;
+    lines.push(truncateToWidth(`\x1b[1m${header}\x1b[0m`, width));
+
+    const shortPath = this.sessionFile.replace(/^.*\/sessions\//, "sessions/");
+    lines.push(truncateToWidth(`\x1b[2m${shortPath}\x1b[0m`, width));
+    lines.push("─".repeat(Math.min(width, 80)));
+
+    const outputHeight = 18;
+    const visibleStart = Math.max(0, this.outputLines.length - outputHeight - this.scrollOffset);
+    const visibleEnd = Math.min(this.outputLines.length, visibleStart + outputHeight);
+    const visibleLines = this.outputLines.slice(visibleStart, visibleEnd);
+
+    for (const line of visibleLines) {
+      const wrapped = wrapTextWithAnsi(line, width);
+      for (const wl of wrapped) {
+        lines.push(truncateToWidth(wl, width));
+      }
+    }
+
+    while (lines.length < outputHeight + 3) {
+      lines.push("");
+    }
+
+    if (this.outputLines.length > outputHeight) {
+      const scrollInfo = this.scrollOffset > 0
+        ? `[${this.scrollOffset} lines below, PgUp/PgDn to scroll]`
+        : `[${Math.max(0, this.outputLines.length - outputHeight)} lines above]`;
+      lines.push(truncateToWidth(`\x1b[2m${scrollInfo}\x1b[0m`, width));
+    } else {
+      lines.push("");
+    }
+
+    lines.push("─".repeat(Math.min(width, 80)));
+    const footer = "\x1b[2mEsc/q: close | PgUp/PgDn: scroll\x1b[0m";
+    lines.push(truncateToWidth(footer, width));
+
+    this.cachedWidth = width;
+    this.cachedRender = lines;
+    return lines;
+  }
+
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedRender = undefined;
+  }
+}
+
+/**
+ * Run a session watcher for a workspace
+ */
+async function runSessionWatcher(
+  ctx: ExtensionContext,
+  workspace: { name: string; path: string }
+): Promise<void> {
+  // Find session files for this workspace
+  const sessionFiles = await findWorkspaceSessionFiles(workspace.path);
+
+  if (sessionFiles.length === 0) {
+    ctx.ui.notify("No session files found for this workspace", "warning");
+    return;
+  }
+
+  // Let user select a session if multiple exist
+  let selectedFile = sessionFiles[0];
+
+  if (sessionFiles.length > 1) {
+    const options: string[] = [];
+    for (const file of sessionFiles.slice(0, 10)) {
+      try {
+        const summary = await getSessionSummary(file);
+        const date = summary.lastModified.toLocaleString();
+        const preview = summary.firstMessage?.slice(0, 40) || "(no messages)";
+        options.push(`${date}: ${preview}...`);
+      } catch {
+        options.push(file.split("/").pop() || file);
+      }
+    }
+
+    const selection = await ctx.ui.select("Select a session to watch:", options);
+    if (selection == null) {
+      ctx.ui.notify("Cancelled", "info");
+      return;
+    }
+
+    const selectedIndex = options.indexOf(selection);
+    if (selectedIndex >= 0) {
+      selectedFile = sessionFiles[selectedIndex];
+    }
+  }
+
+  const view = new SessionWatcherView(workspace.name, selectedFile);
+
+  const closeWatcher = () => {
+    if (view.watcher) {
+      view.watcher.stop();
+    }
+  };
+
+  view.onClose = closeWatcher;
+
+  const watcher = new SessionWatcher(selectedFile, {
+    onEntry: (entry) => {
+      const formatted = formatSessionEntry(entry);
+      if (formatted) {
+        view.appendOutput(formatted);
+      }
+      view.incrementEntryCount();
+    },
+    onError: (error) => {
+      view.setStatus("error", error.message);
+    },
+  });
+
+  view.watcher = watcher;
+
+  await ctx.ui.custom<void>((tui, _theme, _kb, done) => {
+    view.requestRenderFn = () => tui.requestRender();
+    view.onClose = () => {
+      closeWatcher();
+      done();
+    };
+
+    watcher.start().catch((err) => {
+      view.setStatus("error", err.message);
+    });
+
+    return view;
+  });
+}
+
+/**
+ * Run an interactive RPC session in a workspace
+ */
+async function runInteractiveRpcSession(
+  ctx: ExtensionContext,
+  workspace: { name: string; path: string }
+): Promise<void> {
+  const view = new RpcSessionView(workspace.name, workspace.path);
+
+  let handle: { close: () => void; requestRender: () => void } | undefined;
+
+  const closeSession = () => {
+    if (view.rpcClient) {
+      view.rpcClient.close();
+    }
+    handle?.close();
+  };
+
+  view.onClose = closeSession;
+
+  // Start the RPC client
+  const rpcClient = new RpcClient({
+    cwd: workspace.path,
+    onEvent: (event) => {
+      // Handle streaming text
+      const textDelta = getTextDelta(event);
+      if (textDelta) {
+        view.appendOutput(textDelta);
+        return;
+      }
+
+      // Handle tool events
+      const toolText = formatToolEvent(event);
+      if (toolText) {
+        view.appendOutput(`\n${toolText}\n`);
+        if (event.type === "tool_execution_start") {
+          view.setCurrentTool((event as any).toolName);
+        } else if (event.type === "tool_execution_end") {
+          view.setCurrentTool(undefined);
+        }
+        return;
+      }
+
+      // Handle agent lifecycle
+      if (isAgentStart(event)) {
+        view.setStatus("running");
+        return;
+      }
+      if (isAgentEnd(event)) {
+        view.setStatus("idle");
+        view.appendOutput("\n");
+        return;
+      }
+
+      // Handle extension UI requests (auto-respond for now)
+      if (event.type === "extension_ui_request") {
+        const uiReq = event as ExtensionUiRequestEvent;
+        // For now, auto-cancel extension UI requests
+        // Future: could show these in the parent UI
+        if (uiReq.method === "notify") {
+          view.appendOutput(`\n[${uiReq.notifyType || "info"}] ${uiReq.message}\n`);
+        } else {
+          view.appendOutput(`\n[Extension UI: ${uiReq.method}]\n`);
+          rpcClient.respondToUiRequest(uiReq.id, { cancelled: true });
+        }
+        return;
+      }
+    },
+    onError: (error) => {
+      view.appendOutput(`\n[Error: ${error.message}]\n`);
+    },
+    onClose: (code) => {
+      view.setStatus("closed");
+      view.appendOutput(`\n[Session closed with code ${code}]\n`);
+    },
+  });
+
+  view.rpcClient = rpcClient;
+
+  // Show the view
+  await ctx.ui.custom<void>((tui, _theme, _kb, done) => {
+    view.requestRenderFn = () => tui.requestRender();
+    view.onClose = () => {
+      closeSession();
+      done();
+    };
+
+    // Start the RPC client asynchronously
+    rpcClient.start().then(() => {
+      view.setStatus("idle");
+      view.appendOutput("Connected to workspace agent.\n");
+      view.appendOutput("Type a prompt below or press Esc to close.\n\n");
+    }).catch((err) => {
+      view.setStatus("error", err.message);
+      view.appendOutput(`Failed to connect: ${err.message}\n`);
+    });
+
+    return view;
+  });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -622,6 +1181,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("jj-attach", {
     description: "Attach to a pi agent running in a jj workspace",
     handler: async (_args, ctx) => {
+      // Debug: Verify command handler is being reached
+      ctx.ui.notify("Loading workspaces...", "info");
+      
       const env = await validateJJEnvironment(pi, ctx.cwd);
       if (!env.valid) {
         ctx.ui.notify(env.error || "Not in a jj repository", "error");
@@ -681,7 +1243,10 @@ export default function (pi: ExtensionAPI) {
       // Offer actions for the selected workspace
       const tracked = activeWorkspaces.get(selectedWorkspace.name);
       const actionOptions = [
-        "Start new pi session in workspace",
+        "Interactive session (embedded view)",
+        "Start new pi session (fullscreen)",
+        "Watch workspace session",
+        "Resume workspace session",
         "View workspace diff",
         "View workspace log",
       ];
@@ -705,7 +1270,13 @@ export default function (pi: ExtensionAPI) {
 
       switch (actionIndex) {
         case 0: {
-          // Start new pi session in the workspace
+          // Interactive session using RPC mode (embedded view)
+          await runInteractiveRpcSession(ctx, selectedWorkspace);
+          break;
+        }
+
+        case 1: {
+          // Start new pi session (fullscreen)
           // Use ctx.ui.custom() to properly suspend/resume the TUI
           const invocation = getPiInvocation([]);
           
@@ -749,7 +1320,86 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        case 1: {
+        case 2: {
+          // Watch workspace session
+          await runSessionWatcher(ctx, selectedWorkspace);
+          break;
+        }
+
+        case 3: {
+          // Resume workspace session
+          // Find and let user pick a session, then open pi with --session flag
+          const sessionFiles = await findWorkspaceSessionFiles(selectedWorkspace.path);
+
+          if (sessionFiles.length === 0) {
+            ctx.ui.notify("No session files found for this workspace", "warning");
+            break;
+          }
+
+          let selectedSession = sessionFiles[0];
+
+          if (sessionFiles.length > 1) {
+            const options: string[] = [];
+            for (const file of sessionFiles.slice(0, 10)) {
+              try {
+                const summary = await getSessionSummary(file);
+                const date = summary.lastModified.toLocaleString();
+                const preview = summary.firstMessage?.slice(0, 40) || "(no messages)";
+                options.push(`${date}: ${preview}...`);
+              } catch {
+                options.push(file.split("/").pop() || file);
+              }
+            }
+
+            const selection = await ctx.ui.select("Select a session to resume:", options);
+            if (selection == null) {
+              ctx.ui.notify("Cancelled", "info");
+              break;
+            }
+
+            const selectedIndex = options.indexOf(selection);
+            if (selectedIndex >= 0) {
+              selectedSession = sessionFiles[selectedIndex];
+            }
+          }
+
+          // Open pi with the selected session in fullscreen mode
+          const invocation = getPiInvocation(["--session", selectedSession]);
+
+          const exitCode = await ctx.ui.custom<number | null>((tui, _theme, _kb, done) => {
+            tui.stop();
+            process.stdout.write("\x1b[2J\x1b[H");
+
+            const proc = spawn(invocation.command, invocation.args, {
+              cwd: selectedWorkspace.path,
+              stdio: "inherit",
+              shell: false,
+            });
+
+            proc.on("close", (code) => {
+              tui.start();
+              tui.requestRender(true);
+              done(code);
+            });
+
+            proc.on("error", () => {
+              tui.start();
+              tui.requestRender(true);
+              done(null);
+            });
+
+            return { render: () => [], invalidate: () => {} };
+          });
+
+          if (exitCode !== null) {
+            ctx.ui.notify(`Returned from session (exit code: ${exitCode})`, "info");
+          } else {
+            ctx.ui.notify(`Failed to start pi session`, "error");
+          }
+          break;
+        }
+
+        case 4: {
           // View diff
           try {
             const diff = await jjDiff(pi, selectedWorkspace.path);
@@ -764,7 +1414,7 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        case 2: {
+        case 5: {
           // View log
           try {
             const log = await jjLog(pi, selectedWorkspace.path, 5);
@@ -775,7 +1425,7 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        case 3: {
+        case 6: {
           // View tracked agent status (only shown if tracked)
           if (tracked) {
             const ws = tracked.workspace;

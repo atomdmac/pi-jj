@@ -12,6 +12,8 @@ Create isolated workspaces for tasks and spawn subagents to work on them indepen
 - **Lifecycle Management**: Keep, squash, or delete workspaces after completion
 - **Session Persistence**: Workspace state survives session restarts
 - **Status Indicator**: Shows active workspaces in the footer
+- **Interactive Attach**: Embedded RPC sessions, session watching, and session resumption
+- **Developer APIs**: `RpcClient` and `SessionWatcher` for building integrations
 
 ## Installation
 
@@ -101,7 +103,10 @@ This command allows you to:
 1. See all jj workspaces with their status (active, completed, failed)
 2. Select a workspace
 3. Choose an action:
-   - **Start new pi session** - Launches an interactive pi agent in the workspace directory
+   - **Interactive session (embedded view)** - Opens an embedded RPC session within the current TUI. Send prompts, see streaming output, and interact with the workspace agent without leaving your session. Supports scrolling (PgUp/PgDn), abort (Ctrl+C), and close (Esc).
+   - **Start new pi session (fullscreen)** - Launches an interactive pi agent in the workspace directory, temporarily suspending the parent TUI for full terminal access.
+   - **Watch workspace session** - Monitor a running or completed session in real-time by watching its session file. Useful for observing subagent progress without interaction.
+   - **Resume workspace session** - Select and resume a previous session from the workspace, continuing where it left off.
    - **View workspace diff** - Shows current changes in the workspace
    - **View workspace log** - Shows recent commit history
    - **View tracked agent status** - Shows details of the agent that ran in this workspace (if tracked)
@@ -158,6 +163,79 @@ Agent: I'll create a jj workspace for this task.
 > Squash & Delete
 
 ✓ Workspace "api-input-validation" squashed and deleted
+```
+
+## Developer APIs
+
+The extension exports two modules for building on top of pi-jj:
+
+### RpcClient
+
+Communicate with a pi subprocess running in RPC mode (`--mode rpc`):
+
+```typescript
+import { RpcClient, getTextDelta, isAgentEnd, formatToolEvent } from "pi-jj/lib/rpc-client.js";
+
+const client = new RpcClient({
+  cwd: "/path/to/workspace",
+  onEvent: (event) => {
+    // Handle streaming events
+    const text = getTextDelta(event);
+    if (text) console.log(text);
+    
+    const toolInfo = formatToolEvent(event);
+    if (toolInfo) console.log(toolInfo);
+    
+    if (isAgentEnd(event)) console.log("Agent finished");
+  },
+  onError: (err) => console.error(err),
+  onClose: (code) => console.log(`Closed with code ${code}`),
+});
+
+await client.start();
+await client.prompt("Refactor the auth module");
+await client.abort();  // Cancel current operation
+await client.getState();  // Get agent state
+client.close();
+```
+
+**Event Types:**
+- `message_update` - Streaming text from the assistant
+- `tool_execution_start/update/end` - Tool execution lifecycle
+- `agent_start/end` - Agent lifecycle
+- `extension_ui_request` - UI requests from extensions
+
+### SessionWatcher
+
+Monitor a session JSONL file for real-time updates:
+
+```typescript
+import { 
+  SessionWatcher, 
+  findWorkspaceSessionFiles, 
+  formatSessionEntry,
+  getSessionSummary 
+} from "pi-jj/lib/session-watcher.js";
+
+// Find session files for a workspace
+const files = await findWorkspaceSessionFiles("/path/to/workspace");
+
+// Get session summary
+const summary = await getSessionSummary(files[0]);
+console.log(`${summary.messageCount} messages, last modified: ${summary.lastModified}`);
+
+// Watch for new entries
+const watcher = new SessionWatcher(files[0], {
+  onEntry: (entry) => {
+    const formatted = formatSessionEntry(entry);
+    if (formatted) console.log(formatted);
+  },
+  onError: (err) => console.error(err),
+});
+
+await watcher.start();
+// ... later
+watcher.stop();
 ```
 
 ## Configuration
