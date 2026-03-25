@@ -287,6 +287,92 @@ export async function jjDiff(pi: ExtensionAPI, cwd: string): Promise<string> {
 }
 
 /**
+ * Get bookmarks pointing to the current working copy change
+ */
+export async function jjCurrentBookmarks(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+  // Use template to get bookmarks for the current change (@)
+  const result = await pi.exec(
+    "jj",
+    ["log", "-r", "@", "-T", 'bookmarks.map(|b| b.name()).join(",")', "--no-graph"],
+    { cwd, timeout: 5000 }
+  );
+
+  if (result.code !== 0) return [];
+
+  const output = result.stdout.trim();
+  if (!output) return [];
+
+  return output.split(",").filter(Boolean);
+}
+
+/**
+ * Get the current workspace name
+ */
+export async function jjCurrentWorkspaceName(pi: ExtensionAPI, cwd: string): Promise<string | null> {
+  // Get workspace list and find the current one
+  const template = 'self.name() ++ "\\n"';
+  const listResult = await pi.exec("jj", ["workspace", "list", "-T", template], { cwd, timeout: 5000 });
+  
+  if (listResult.code !== 0) return null;
+
+  const names = listResult.stdout.trim().split("\n").filter(Boolean);
+  
+  // Get current workspace root
+  const rootResult = await pi.exec("jj", ["workspace", "root"], { cwd, timeout: 5000 });
+  if (rootResult.code !== 0) return null;
+  const currentRoot = rootResult.stdout.trim();
+
+  // Get repo root (default workspace location)
+  const repoRoot = await jjRoot(pi, cwd);
+
+  // Check if we're in the default workspace
+  if (currentRoot === repoRoot && names.includes("default")) {
+    return "default";
+  }
+
+  // For non-default workspaces, match by path pattern
+  // jj typically creates workspaces as siblings: repo-workspacename
+  for (const name of names) {
+    if (name === "default") continue;
+    
+    // Check if current root ends with the workspace name pattern
+    if (currentRoot.endsWith(`-${name}`) || currentRoot.endsWith(`/${name}`)) {
+      return name;
+    }
+  }
+
+  // Fallback: if only one workspace, that's us
+  if (names.length === 1) {
+    return names[0];
+  }
+
+  return null;
+}
+
+/**
+ * Get JJ status info for display (bookmark and workspace)
+ */
+export interface JJStatusInfo {
+  isRepo: boolean;
+  workspaceName: string | null;
+  bookmarks: string[];
+}
+
+export async function jjGetStatusInfo(pi: ExtensionAPI, cwd: string): Promise<JJStatusInfo> {
+  const isRepo = await jjIsRepo(pi, cwd);
+  if (!isRepo) {
+    return { isRepo: false, workspaceName: null, bookmarks: [] };
+  }
+
+  const [workspaceName, bookmarks] = await Promise.all([
+    jjCurrentWorkspaceName(pi, cwd),
+    jjCurrentBookmarks(pi, cwd),
+  ]);
+
+  return { isRepo: true, workspaceName, bookmarks };
+}
+
+/**
  * Generate a safe workspace name from a task description
  */
 export function sanitizeWorkspaceName(task: string): string {

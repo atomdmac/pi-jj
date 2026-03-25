@@ -20,6 +20,7 @@ import {
   jjWorkspaceList,
   jjLog,
   jjDiff,
+  jjGetStatusInfo,
   sanitizeWorkspaceName,
 } from "./lib/jj.js";
 import {
@@ -76,15 +77,64 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Update status if we have active workspaces
+    // Check if we're in a JJ repo and show status info
+    await updateJJStatus(pi, ctx);
+
+    // Also show active workspaces if any
     const active = Array.from(activeWorkspaces.values()).filter(
       (w) => w.workspace.status === "active"
     );
     if (active.length > 0) {
+      // Active workspaces take precedence in status display
       const names = active.map((w) => w.workspace.name).join(", ");
-      ctx.ui.setStatus("pi-jj", ctx.ui.theme.fg("accent", `jj: ${names}`));
+      ctx.ui.setStatus("pi-jj", ctx.ui.theme.fg("accent", `jj: ${names} (active)`));
     }
   });
+
+  // Update status when cwd changes
+  pi.on("cwd_change", async (_event, ctx) => {
+    await updateJJStatus(pi, ctx);
+  });
+
+  /**
+   * Helper to update JJ status in the status line
+   */
+  async function updateJJStatus(pi: ExtensionAPI, ctx: ExtensionContext) {
+    try {
+      const statusInfo = await jjGetStatusInfo(pi, ctx.cwd);
+
+      if (!statusInfo.isRepo) {
+        ctx.ui.setStatus("pi-jj", undefined);
+        return;
+      }
+
+      // Build status string: bookmark@workspace or just workspace or just bookmark
+      const parts: string[] = [];
+
+      if (statusInfo.bookmarks.length > 0) {
+        // Show first bookmark (most relevant), with indicator if there are more
+        const bookmarkDisplay = statusInfo.bookmarks.length > 1
+          ? `${statusInfo.bookmarks[0]}+${statusInfo.bookmarks.length - 1}`
+          : statusInfo.bookmarks[0];
+        parts.push(ctx.ui.theme.fg("accent", bookmarkDisplay));
+      }
+
+      if (statusInfo.workspaceName && statusInfo.workspaceName !== "default") {
+        // Only show workspace if not the default one
+        parts.push(ctx.ui.theme.fg("muted", `@${statusInfo.workspaceName}`));
+      }
+
+      if (parts.length > 0) {
+        ctx.ui.setStatus("pi-jj", ctx.ui.theme.fg("dim", "jj: ") + parts.join(""));
+      } else {
+        // In a jj repo but no bookmark or special workspace - just show "jj"
+        ctx.ui.setStatus("pi-jj", ctx.ui.theme.fg("dim", "jj"));
+      }
+    } catch {
+      // Silently ignore errors - might not be in a jj repo
+      ctx.ui.setStatus("pi-jj", undefined);
+    }
+  }
 
   // Warn about active workspaces on shutdown
   pi.on("session_shutdown", async (_event, ctx) => {
