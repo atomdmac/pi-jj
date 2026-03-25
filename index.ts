@@ -608,12 +608,19 @@ export default function (pi: ExtensionAPI) {
 
       // Let user select a workspace
       const selection = await ctx.ui.select("Select a workspace to attach to:", options);
-      if (selection === undefined) {
+      if (selection == null) {
         ctx.ui.notify("Cancelled", "info");
         return;
       }
 
-      const selectedWorkspace = workspaces[selection];
+      // ctx.ui.select returns the selected label, not the index
+      const selectedIndex = options.indexOf(selection);
+      if (selectedIndex === -1) {
+        ctx.ui.notify("Error: could not find selected workspace", "error");
+        return;
+      }
+
+      const selectedWorkspace = workspaces[selectedIndex];
 
       // Check if we're already in this workspace
       if (selectedWorkspace.isCurrent) {
@@ -638,38 +645,56 @@ export default function (pi: ExtensionAPI) {
         actionOptions
       );
 
-      if (actionSelection === undefined) {
+      if (actionSelection == null) {
         ctx.ui.notify("Cancelled", "info");
         return;
       }
 
-      switch (actionSelection) {
-        case 0: {
-          // Start new pi session
-          // We spawn an interactive pi process in the workspace directory
-          ctx.ui.notify(`Starting pi session in ${selectedWorkspace.path}...`, "info");
+      // ctx.ui.select returns the selected label, not the index
+      const actionIndex = actionOptions.indexOf(actionSelection);
 
-          // Use pi.exec to spawn an interactive pi session
-          // Since we can't truly "attach" to a TUI from within a TUI,
-          // we'll spawn pi in a way that takes over
+      switch (actionIndex) {
+        case 0: {
+          // Start new pi session in the workspace
+          // Use ctx.ui.custom() to properly suspend/resume the TUI
           const invocation = getPiInvocation([]);
-          try {
-            // Spawn pi interactively - this will take over the terminal
+          
+          const exitCode = await ctx.ui.custom<number | null>((tui, _theme, _kb, done) => {
+            // Stop TUI to release terminal
+            tui.stop();
+
+            // Clear screen
+            process.stdout.write("\x1b[2J\x1b[H");
+
+            // Spawn pi interactively with full terminal access
             const proc = spawn(invocation.command, invocation.args, {
               cwd: selectedWorkspace.path,
               stdio: "inherit",
               shell: false,
             });
 
-            // Wait for the process to exit
-            await new Promise<void>((resolve, reject) => {
-              proc.on("close", () => resolve());
-              proc.on("error", (err) => reject(err));
+            proc.on("close", (code) => {
+              // Restart TUI
+              tui.start();
+              tui.requestRender(true);
+              done(code);
             });
 
-            ctx.ui.notify(`Returned from workspace "${selectedWorkspace.name}"`, "info");
-          } catch (err) {
-            ctx.ui.notify(`Failed to start pi: ${err}`, "error");
+            proc.on("error", (err) => {
+              // Restart TUI even on error
+              tui.start();
+              tui.requestRender(true);
+              done(null);
+            });
+
+            // Return empty component (will be disposed when done() is called)
+            return { render: () => [], invalidate: () => {} };
+          });
+
+          if (exitCode !== null) {
+            ctx.ui.notify(`Returned from workspace "${selectedWorkspace.name}" (exit code: ${exitCode})`, "info");
+          } else {
+            ctx.ui.notify(`Failed to start pi session`, "error");
           }
           break;
         }
