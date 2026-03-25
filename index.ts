@@ -36,9 +36,11 @@ import {
   getDisplayItems,
   formatUsageStats,
   formatToolCall,
+  getPiInvocation,
   type SubagentResult,
   type SubagentUsage,
 } from "./lib/subagent.js";
+import { spawn } from "node:child_process";
 
 // Custom entry type for session persistence
 const WORKSPACE_ENTRY_TYPE = "pi-jj-workspace";
@@ -562,6 +564,186 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(log.trim(), "info");
       } catch (err) {
         ctx.ui.notify(`Failed to get status: ${err}`, "error");
+      }
+    },
+  });
+
+  // Register /jj-attach command
+  pi.registerCommand("jj-attach", {
+    description: "Attach to a pi agent running in a jj workspace",
+    handler: async (_args, ctx) => {
+      const env = await validateJJEnvironment(pi, ctx.cwd);
+      if (!env.valid) {
+        ctx.ui.notify(env.error || "Not in a jj repository", "error");
+        return;
+      }
+
+      // Get all jj workspaces
+      let workspaces: Awaited<ReturnType<typeof jjWorkspaceList>>;
+      try {
+        workspaces = await jjWorkspaceList(pi, ctx.cwd);
+      } catch (err) {
+        ctx.ui.notify(`Failed to list workspaces: ${err}`, "error");
+        return;
+      }
+
+      if (workspaces.length === 0) {
+        ctx.ui.notify("No workspaces found", "info");
+        return;
+      }
+
+      // Build workspace options with status info
+      const options = workspaces.map((ws) => {
+        const tracked = activeWorkspaces.get(ws.name);
+        let status = "";
+        if (ws.isCurrent) {
+          status = " (current)";
+        } else if (tracked) {
+          const wsStatus = tracked.workspace.status;
+          const icon = wsStatus === "active" ? "⏳" : wsStatus === "completed" ? "✓" : wsStatus === "failed" ? "✗" : "○";
+          status = ` ${icon} ${wsStatus}`;
+        }
+        return `${ws.name}${status} - ${ws.path}`;
+      });
+
+      // Let user select a workspace
+      const selection = await ctx.ui.select("Select a workspace to attach to:", options);
+      if (selection === undefined) {
+        ctx.ui.notify("Cancelled", "info");
+        return;
+      }
+
+      const selectedWorkspace = workspaces[selection];
+
+      // Check if we're already in this workspace
+      if (selectedWorkspace.isCurrent) {
+        ctx.ui.notify("Already in this workspace", "info");
+        return;
+      }
+
+      // Offer actions for the selected workspace
+      const tracked = activeWorkspaces.get(selectedWorkspace.name);
+      const actionOptions = [
+        "Start new pi session in workspace",
+        "View workspace diff",
+        "View workspace log",
+      ];
+
+      if (tracked) {
+        actionOptions.push("View tracked agent status");
+      }
+
+      const actionSelection = await ctx.ui.select(
+        `Workspace "${selectedWorkspace.name}" - Choose action:`,
+        actionOptions
+      );
+
+      if (actionSelection === undefined) {
+        ctx.ui.notify("Cancelled", "info");
+        return;
+      }
+
+      switch (actionSelection) {
+        case 0: {
+          // Start new pi session
+          // We spawn an interactive pi process in the workspace directory
+          ctx.ui.notify(`Starting pi session in ${selectedWorkspace.path}...`, "info");
+
+          // Use pi.exec to spawn an interactive pi session
+          // Since we can't truly "attach" to a TUI from within a TUI,
+          // we'll spawn pi in a way that takes over
+          const invocation = getPiInvocation([]);
+          try {
+            // Spawn pi interactively - this will take over the terminal
+            const proc = spawn(invocation.command, invocation.args, {
+              cwd: selectedWorkspace.path,
+              stdio: "inherit",
+              shell: false,
+            });
+
+            // Wait for the process to exit
+            await new Promise<void>((resolve, reject) => {
+              proc.on("close", () => resolve());
+              proc.on("error", (err) => reject(err));
+            });
+
+            ctx.ui.notify(`Returned from workspace "${selectedWorkspace.name}"`, "info");
+          } catch (err) {
+            ctx.ui.notify(`Failed to start pi: ${err}`, "error");
+          }
+          break;
+        }
+
+        case 1: {
+          // View diff
+          try {
+            const diff = await jjDiff(pi, selectedWorkspace.path);
+            if (diff.trim()) {
+              ctx.ui.notify(`Diff in "${selectedWorkspace.name}":\n${diff}`, "info");
+            } else {
+              ctx.ui.notify(`No changes in workspace "${selectedWorkspace.name}"`, "info");
+            }
+          } catch (err) {
+            ctx.ui.notify(`Failed to get diff: ${err}`, "error");
+          }
+          break;
+        }
+
+        case 2: {
+          // View log
+          try {
+            const log = await jjLog(pi, selectedWorkspace.path, 5);
+            ctx.ui.notify(`Log for "${selectedWorkspace.name}":\n${log}`, "info");
+          } catch (err) {
+            ctx.ui.notify(`Failed to get log: ${err}`, "error");
+          }
+          break;
+        }
+
+        case 3: {
+          // View tracked agent status (only shown if tracked)
+          if (tracked) {
+            const ws = tracked.workspace;
+            const result = tracked.result;
+
+            let statusText = `Workspace: ${ws.name}\n`;
+            statusText += `Path: ${ws.path}\n`;
+            statusText += `Status: ${ws.status}\n`;
+            statusText += `Task: ${ws.task}\n`;
+            statusText += `Created: ${new Date(ws.createdAt).toLocaleString()}\n`;
+
+            if (result) {
+              statusText += `\nAgent Result:\n`;
+              statusText += `  Success: ${result.success}\n`;
+              statusText += `  Exit Code: ${result.exitCode}\n`;
+              if (result.model) {
+                statusText += `  Model: ${result.model}\n`;
+              }
+              if (result.usage) {
+                statusText += `  Usage: ${formatUsageStats(result.usage, result.model)}\n`;
+              }
+              if (result.errorMessage) {
+                statusText += `  Error: ${result.errorMessage}\n`;
+              }
+
+              const output = getFinalOutput(result.messages);
+              if (output) {
+                const preview = output.length > 500 ? output.slice(0, 500) + "..." : output;
+                statusText += `\nOutput:\n${preview}\n`;
+              }
+            }
+
+            if (tracked.lifecycleAction) {
+              statusText += `\nLifecycle Action: ${tracked.lifecycleAction}`;
+              if (tracked.lifecycleMessage) {
+                statusText += `\n${tracked.lifecycleMessage}`;
+              }
+            }
+
+            ctx.ui.notify(statusText, "info");
+          }
+          break;
+        }
       }
     },
   });

@@ -91,7 +91,7 @@ export function getDisplayItems(messages: Message[]): DisplayItem[] {
 /**
  * Determine how to invoke pi
  */
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+export function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1];
   if (currentScript && fs.existsSync(currentScript)) {
     return { command: process.execPath, args: [currentScript, ...args] };

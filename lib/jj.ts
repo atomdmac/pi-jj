@@ -60,8 +60,8 @@ export async function jjRoot(pi: ExtensionAPI, cwd: string): Promise<string | nu
  * List all workspaces in the repository
  */
 export async function jjWorkspaceList(pi: ExtensionAPI, cwd: string): Promise<JJWorkspace[]> {
-  // Use template to get structured output
-  const template = 'self.name() ++ "\\t" ++ self.working_copy_path() ++ "\\n"';
+  // Get workspace names using template (WorkspaceRef only has .name() and .target())
+  const template = 'self.name() ++ "\\n"';
   const result = await pi.exec("jj", ["workspace", "list", "-T", template], { cwd, timeout: 10000 });
 
   if (result.code !== 0) {
@@ -69,29 +69,36 @@ export async function jjWorkspaceList(pi: ExtensionAPI, cwd: string): Promise<JJ
   }
 
   const workspaces: JJWorkspace[] = [];
-  const lines = result.stdout.trim().split("\n").filter(Boolean);
+  const names = result.stdout.trim().split("\n").filter(Boolean);
 
-  for (const line of lines) {
-    const [name, path] = line.split("\t");
-    if (name && path) {
-      workspaces.push({
-        name: name.trim(),
-        path: path.trim(),
-        isCurrent: false, // Will be set below
-      });
-    }
-  }
-
-  // Determine current workspace
+  // Get current workspace path
   const currentResult = await pi.exec("jj", ["workspace", "root"], { cwd, timeout: 5000 });
-  if (currentResult.code === 0) {
-    const currentPath = currentResult.stdout.trim();
-    for (const ws of workspaces) {
-      if (ws.path === currentPath) {
-        ws.isCurrent = true;
-        break;
-      }
+  const currentPath = currentResult.code === 0 ? currentResult.stdout.trim() : "";
+
+  // Get repo root to construct workspace paths
+  const repoRoot = await jjRoot(pi, cwd);
+
+  for (const name of names) {
+    const trimmedName = name.trim();
+    // For the default workspace, use the repo root
+    // For other workspaces, they're typically siblings of the repo root
+    let wsPath: string;
+    if (trimmedName === "default" && repoRoot) {
+      wsPath = repoRoot;
+    } else if (repoRoot) {
+      // Workspaces created by jj workspace add are typically siblings
+      const parentDir = repoRoot.replace(/\/[^/]+$/, "");
+      wsPath = `${parentDir}/${trimmedName}`;
+    } else {
+      wsPath = trimmedName;
     }
+
+    const isCurrent = wsPath === currentPath;
+    workspaces.push({
+      name: trimmedName,
+      path: isCurrent ? currentPath : wsPath,
+      isCurrent,
+    });
   }
 
   return workspaces;
