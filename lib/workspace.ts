@@ -293,5 +293,8 @@ export async function promptLifecycleAction(
   );
 
   if (choice === undefined) return null;
-  return options[choice].value as WorkspaceLifecycleAction;
+  
+  // ctx.ui.select returns the selected string, not an index
+  const selected = options.find((o) => o.label === choice);
+  return selected ? (selected.value as WorkspaceLifecycleAction) : null;
 }
