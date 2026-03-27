@@ -685,6 +685,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+
   // Register /jj-switch command to switch to another workspace
   pi.registerCommand("jj-switch", {
     description: "Switch to another jj workspace and start a pi session there",
@@ -696,7 +697,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
-        const workspaces = await jjWorkspaceList(pi, ctx.cwd);
+        const workspaces = await jjWorkspaceList(pi, ctx.cwd, env.repoRoot);
         if (workspaces.length === 0) {
           ctx.ui.notify("No workspaces found", "info");
           return;

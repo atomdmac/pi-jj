@@ -45,30 +45,33 @@ export type WorkspaceLifecycleAction = "keep" | "squash-keep" | "squash-delete" 
 
 /**
  * Validate that we're in a jj repository and jj is available
+ * 
+ * Optimized to use a single `jj root` call instead of separate isRepo + root calls.
  */
 export async function validateJJEnvironment(
   pi: ExtensionAPI,
   cwd: string
 ): Promise<{ valid: boolean; error?: string; repoRoot?: string }> {
-  // Check if jj is available
-  const versionResult = await pi.exec("jj", ["--version"], { timeout: 5000 });
-  if (versionResult.code !== 0) {
-    return {
-      valid: false,
-      error: "jj is not installed or not in PATH. Install from https://github.com/martinvonz/jj",
-    };
-  }
-
-  // Check if we're in a jj repo
-  const isRepo = await jjIsRepo(pi, cwd);
-  if (!isRepo) {
+  // Single call to `jj root` - checks both availability and repo status
+  // If jj isn't installed, this fails. If not in a repo, this also fails.
+  const rootResult = await pi.exec("jj", ["root"], { cwd, timeout: 5000 });
+  
+  if (rootResult.code !== 0) {
+    const stderr = rootResult.stderr.toLowerCase();
+    // Distinguish between "jj not found" and "not in a repo"
+    if (stderr.includes("not found") || stderr.includes("no such file")) {
+      return {
+        valid: false,
+        error: "jj is not installed or not in PATH. Install from https://github.com/martinvonz/jj",
+      };
+    }
     return {
       valid: false,
       error: `Not in a jj repository: ${cwd}`,
     };
   }
 
-  const repoRoot = await jjRoot(pi, cwd);
+  const repoRoot = rootResult.stdout.trim();
   if (!repoRoot) {
     return {
       valid: false,
@@ -100,7 +103,7 @@ export async function createWorkspace(
   }
 
   // Check if workspace already exists
-  const existingWorkspaces = await jjWorkspaceList(pi, cwd);
+  const existingWorkspaces = await jjWorkspaceList(pi, cwd, env.repoRoot);
   if (existingWorkspaces.some((w) => w.name === workspaceName)) {
     return {
       success: false,

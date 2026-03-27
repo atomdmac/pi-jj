@@ -62,25 +62,31 @@ export async function jjRoot(pi: ExtensionAPI, cwd: string): Promise<string | nu
  * NOTE: jj doesn't expose workspace paths via templates (WorkspaceRef only has .name() and .target()).
  * For non-current workspaces, we can only guess the path based on naming conventions.
  * The current workspace path is accurate via `jj workspace root`.
+ * 
+ * @param pi - Extension API
+ * @param cwd - Current working directory
+ * @param repoRoot - Optional repo root (pass if already known to avoid redundant call)
  */
-export async function jjWorkspaceList(pi: ExtensionAPI, cwd: string): Promise<JJWorkspace[]> {
+export async function jjWorkspaceList(pi: ExtensionAPI, cwd: string, repoRoot?: string): Promise<JJWorkspace[]> {
   // Get workspace names using template (WorkspaceRef only has .name() and .target())
   const template = 'self.name() ++ "\\n"';
-  const result = await pi.exec("jj", ["workspace", "list", "-T", template], { cwd, timeout: 10000 });
+  
+  // Run workspace list and workspace root in parallel (and repo root if not provided)
+  const [listResult, currentResult, resolvedRepoRoot] = await Promise.all([
+    pi.exec("jj", ["workspace", "list", "-T", template], { cwd, timeout: 10000 }),
+    pi.exec("jj", ["workspace", "root"], { cwd, timeout: 5000 }),
+    repoRoot ? Promise.resolve(repoRoot) : jjRoot(pi, cwd),
+  ]);
 
-  if (result.code !== 0) {
-    throw new Error(`Failed to list workspaces: ${result.stderr}`);
+  if (listResult.code !== 0) {
+    throw new Error(`Failed to list workspaces: ${listResult.stderr}`);
   }
 
   const workspaces: JJWorkspace[] = [];
-  const names = result.stdout.trim().split("\n").filter(Boolean);
+  const names = listResult.stdout.trim().split("\n").filter(Boolean);
 
   // Get current workspace path - this is the only path we can know for certain
-  const currentResult = await pi.exec("jj", ["workspace", "root"], { cwd, timeout: 5000 });
   const currentPath = currentResult.code === 0 ? currentResult.stdout.trim() : "";
-
-  // Get repo root to guess other workspace paths
-  const repoRoot = await jjRoot(pi, cwd);
 
   for (const name of names) {
     const trimmedName = name.trim();
@@ -88,18 +94,18 @@ export async function jjWorkspaceList(pi: ExtensionAPI, cwd: string): Promise<JJ
     // For the default workspace, use the repo root
     // For other workspaces, we can only guess - jj doesn't expose paths
     let wsPath: string;
-    if (trimmedName === "default" && repoRoot) {
-      wsPath = repoRoot;
-    } else if (repoRoot) {
+    if (trimmedName === "default" && resolvedRepoRoot) {
+      wsPath = resolvedRepoRoot;
+    } else if (resolvedRepoRoot) {
       // Best guess: workspaces are siblings with repoName-workspaceName pattern
-      const repoName = repoRoot.split("/").pop() || "";
-      const parentDir = repoRoot.replace(/\/[^/]+$/, "");
+      const repoName = resolvedRepoRoot.split("/").pop() || "";
+      const parentDir = resolvedRepoRoot.replace(/\/[^/]+$/, "");
       wsPath = `${parentDir}/${repoName}-${trimmedName}`;
     } else {
       wsPath = trimmedName;
     }
 
-    const isCurrent = wsPath === currentPath || trimmedName === "default" && currentPath === repoRoot;
+    const isCurrent = wsPath === currentPath || trimmedName === "default" && currentPath === resolvedRepoRoot;
     workspaces.push({
       name: trimmedName,
       path: isCurrent ? currentPath : wsPath,
