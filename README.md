@@ -7,7 +7,7 @@ Create isolated workspaces for tasks and spawn subagents to work on them indepen
 ## Features
 
 - **LLM Tool**: `jj_workspace` - Create workspace and delegate tasks programmatically
-- **Commands**: `/jj-workspace`, `/jj-attach`, `/jj-list`, `/jj-status`
+- **Commands**: `/jj-workspace`, `/jj-attach`, `/jj-switch`, `/jj-list`, `/jj-status`
 - **Isolated Execution**: Each task runs in a separate workspace with fresh context
 - **Lifecycle Management**: Keep, squash, or delete workspaces after completion
 - **Session Persistence**: Workspace state survives session restarts
@@ -110,6 +110,20 @@ This command allows you to:
    - **View workspace diff** - Shows current changes in the workspace
    - **View workspace log** - Shows recent commit history
    - **View tracked agent status** - Shows details of the agent that ran in this workspace (if tracked)
+
+### Command: `/jj-switch`
+
+Switch to another workspace and start a pi session there:
+
+```
+/jj-switch
+```
+
+This command allows you to:
+1. See all jj workspaces with current workspace indicated
+2. Select a different workspace
+3. Start a fullscreen pi session in that workspace
+4. Return to the original session when done
 
 ### Command: `/jj-status`
 

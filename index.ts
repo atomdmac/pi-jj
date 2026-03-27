@@ -608,4 +608,106 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+
+  // Register /jj-switch command to switch to another workspace
+  pi.registerCommand("jj-switch", {
+    description: "Switch to another jj workspace and start a pi session there",
+    handler: async (_args, ctx) => {
+      const env = await validateJJEnvironment(pi, ctx.cwd);
+      if (!env.valid) {
+        ctx.ui.notify(env.error || "Not in a jj repository", "error");
+        return;
+      }
+
+      try {
+        const workspaces = await jjWorkspaceList(pi, ctx.cwd);
+        if (workspaces.length === 0) {
+          ctx.ui.notify("No workspaces found", "info");
+          return;
+        }
+
+        if (workspaces.length === 1) {
+          ctx.ui.notify("Only one workspace exists - nothing to switch to", "info");
+          return;
+        }
+
+        // Build options with current workspace indicator
+        const options = workspaces.map((w) => {
+          const current = w.isCurrent ? " (current)" : "";
+          return `${w.name}${current}`;
+        });
+
+        const choice = await ctx.ui.select("Select workspace to switch to:", options);
+        if (!choice) {
+          ctx.ui.notify("Cancelled", "info");
+          return;
+        }
+
+        // Find the selected workspace
+        const selectedName = choice.replace(" (current)", "");
+        const selected = workspaces.find((w) => w.name === selectedName);
+
+        if (!selected) {
+          ctx.ui.notify("Workspace not found", "error");
+          return;
+        }
+
+        if (selected.isCurrent) {
+          ctx.ui.notify("Already in this workspace", "info");
+          return;
+        }
+
+        ctx.ui.notify(`Switching to workspace "${selected.name}"...`, "info");
+
+        // Start a new pi session in the selected workspace (fullscreen)
+        const invocation = getPiInvocation([]);
+
+        const exitCode = await ctx.ui.custom<number | null>((tui, _theme, _kb, done) => {
+          // Stop TUI to release terminal
+          tui.stop();
+
+          // Clear screen
+          process.stdout.write("\x1b[2J\x1b[H");
+
+          // Spawn pi interactively with full terminal access
+          const proc = spawn(invocation.command, invocation.args, {
+            cwd: selected.path,
+            stdio: "inherit",
+            shell: false,
+          });
+
+          proc.on("close", (code) => {
+            // Restart TUI
+            tui.start();
+            tui.requestRender(true);
+            done(code);
+          });
+
+          proc.on("error", (_err) => {
+            // Restart TUI even on error
+            tui.start();
+            tui.requestRender(true);
+            done(null);
+          });
+
+          // Return empty component (will be disposed when done() is called)
+          return { render: () => [], invalidate: () => {} };
+        });
+
+        if (exitCode !== null) {
+          ctx.ui.notify(
+            `Returned from workspace "${selected.name}" (exit code: ${exitCode})`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify("Failed to start pi session", "error");
+        }
+
+        // Update status after returning
+        await updateJJStatus(pi, ctx);
+      } catch (err) {
+        ctx.ui.notify(`Failed to switch workspace: ${err}`, "error");
+      }
+    },
+  });
 }
