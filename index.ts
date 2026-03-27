@@ -12,11 +12,16 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import {
   Text,
   Container,
   Spacer,
   type Component,
+  type SelectItem,
+  SelectList,
+  matchesKey,
+  Key,
 } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
@@ -24,6 +29,7 @@ import {
   jjWorkspaceList,
   jjGetStatusInfo,
   sanitizeWorkspaceName,
+  type JJWorkspace,
 } from "./lib/jj.js";
 import {
   createWorkspace,
@@ -137,6 +143,125 @@ export default function (pi: ExtensionAPI) {
       // Silently ignore errors - might not be in a jj repo
       ctx.ui.setStatus("pi-jj", undefined);
     }
+  }
+
+  /**
+   * Show an interactive fuzzy finder for workspace selection
+   */
+  async function showWorkspaceSelector(
+    ctx: ExtensionContext,
+    workspaces: JJWorkspace[],
+    title: string
+  ): Promise<JJWorkspace | null> {
+    // Build select items with descriptions
+    const items: SelectItem[] = workspaces.map((w) => {
+      const label = w.isCurrent ? `${w.name} (current)` : w.name;
+      return {
+        value: w.name,
+        label,
+        description: w.path,
+      };
+    });
+
+    const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      const container = new Container();
+
+      // Top border
+      container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+      // Title
+      container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+
+      // Filter input state
+      let filterText = "";
+
+      // Filter display line (shows what user is typing)
+      const filterDisplay = new Text(theme.fg("dim", "Filter: ") + theme.fg("accent", "_"), 1, 0);
+      container.addChild(filterDisplay);
+
+      // SelectList with fuzzy filtering
+      const selectList = new SelectList(items, Math.min(items.length, 10), {
+        selectedPrefix: (text) => theme.fg("accent", text),
+        selectedText: (text) => theme.fg("accent", text),
+        description: (text) => theme.fg("muted", text),
+        scrollInfo: (text) => theme.fg("dim", text),
+        noMatch: (text) => theme.fg("warning", text),
+      });
+
+      selectList.onSelect = (item) => done(item.value);
+      selectList.onCancel = () => done(null);
+
+      container.addChild(selectList);
+
+      // Help text
+      container.addChild(
+        new Text(theme.fg("dim", "type to filter • ↑↓ navigate • enter select • esc cancel"), 1, 0)
+      );
+
+      // Bottom border
+      container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+      // Update filter display
+      const updateFilterDisplay = () => {
+        const cursor = filterText.length > 0 ? "" : "_";
+        filterDisplay.setText(
+          theme.fg("dim", "Filter: ") + theme.fg("accent", filterText + cursor)
+        );
+      };
+
+      return {
+        render: (w) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (data) => {
+          // Handle escape and enter via SelectList
+          if (matchesKey(data, Key.escape)) {
+            done(null);
+            return;
+          }
+          if (matchesKey(data, Key.enter)) {
+            const selected = selectList.getSelectedItem();
+            if (selected) {
+              done(selected.value);
+            }
+            return;
+          }
+
+          // Handle navigation keys via SelectList
+          if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+            selectList.handleInput(data);
+            tui.requestRender();
+            return;
+          }
+
+          // Handle backspace - remove last character from filter
+          if (matchesKey(data, Key.backspace)) {
+            if (filterText.length > 0) {
+              filterText = filterText.slice(0, -1);
+              selectList.setFilter(filterText);
+              updateFilterDisplay();
+              tui.requestRender();
+            }
+            return;
+          }
+
+          // Handle printable characters - add to filter
+          if (data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) < 127) {
+            filterText += data;
+            selectList.setFilter(filterText);
+            updateFilterDisplay();
+            tui.requestRender();
+            return;
+          }
+
+          tui.requestRender();
+        },
+      };
+    });
+
+    if (!result) return null;
+
+    // Find and return the selected workspace
+    return workspaces.find((w) => w.name === result) || null;
   }
 
   // Warn about active workspaces on shutdown
@@ -577,12 +702,17 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const lines = workspaces.map((w) => {
-          const current = w.isCurrent ? " (current)" : "";
-          return `${w.name}${current}: ${w.path}`;
-        });
+        // Show interactive fuzzy finder
+        const selected = await showWorkspaceSelector(ctx, workspaces, "JJ Workspaces");
 
-        ctx.ui.notify(lines.join("\n"), "info");
+        if (selected) {
+          // Show details about the selected workspace
+          const currentTag = selected.isCurrent ? " (current)" : "";
+          ctx.ui.notify(
+            `Workspace: ${selected.name}${currentTag}\nPath: ${selected.path}`,
+            "info"
+          );
+        }
       } catch (err) {
         ctx.ui.notify(`Failed to list workspaces: ${err}`, "error");
       }
@@ -611,24 +741,11 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        // Build options with current workspace indicator
-        const options = workspaces.map((w) => {
-          const current = w.isCurrent ? " (current)" : "";
-          return `${w.name}${current}`;
-        });
-
-        const choice = await ctx.ui.select("Select workspace to switch to:", options);
-        if (!choice) {
-          ctx.ui.notify("Cancelled", "info");
-          return;
-        }
-
-        // Find the selected workspace
-        const selectedName = choice.replace(" (current)", "");
-        const selected = workspaces.find((w) => w.name === selectedName);
+        // Show interactive fuzzy finder for workspace selection
+        const selected = await showWorkspaceSelector(ctx, workspaces, "Switch to Workspace");
 
         if (!selected) {
-          ctx.ui.notify("Workspace not found", "error");
+          ctx.ui.notify("Cancelled", "info");
           return;
         }
 
