@@ -22,7 +22,6 @@ import { Type } from "@sinclair/typebox";
 
 import {
   jjWorkspaceList,
-  jjLog,
   jjGetStatusInfo,
   sanitizeWorkspaceName,
 } from "./lib/jj.js";
@@ -586,25 +585,6 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(lines.join("\n"), "info");
       } catch (err) {
         ctx.ui.notify(`Failed to list workspaces: ${err}`, "error");
-      }
-    },
-  });
-
-  // Register /jj-status command
-  pi.registerCommand("jj-status", {
-    description: "Show jj status and recent changes",
-    handler: async (_args, ctx) => {
-      const env = await validateJJEnvironment(pi, ctx.cwd);
-      if (!env.valid) {
-        ctx.ui.notify(env.error || "Not in a jj repository", "error");
-        return;
-      }
-
-      try {
-        const log = await jjLog(pi, ctx.cwd, 5);
-        ctx.ui.notify(log.trim(), "info");
-      } catch (err) {
-        ctx.ui.notify(`Failed to get status: ${err}`, "error");
       }
     },
   });

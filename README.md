@@ -7,7 +7,7 @@ Create isolated workspaces for tasks and spawn subagents to work on them indepen
 ## Features
 
 - **LLM Tool**: `jj_workspace` - Create workspace and delegate tasks programmatically
-- **Commands**: `/jj-workspace`, `/jj-attach`, `/jj-switch`, `/jj-list`, `/jj-status`
+- **Commands**: `/jj-workspace`, `/jj-attach`, `/jj-switch`, `/jj-list`
 - **Isolated Execution**: Each task runs in a separate workspace with fresh context
 - **Lifecycle Management**: Keep, squash, or delete workspaces after completion
 - **Session Persistence**: Workspace state survives session restarts
@@ -124,14 +124,6 @@ This command allows you to:
 2. Select a different workspace
 3. Start a fullscreen pi session in that workspace
 4. Return to the original session when done
-
-### Command: `/jj-status`
-
-Show recent jj changes:
-
-```
-/jj-status
-```
 
 ## Lifecycle Actions
 
