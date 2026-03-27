@@ -690,14 +690,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("jj-switch", {
     description: "Switch to another jj workspace and start a pi session there",
     handler: async (_args, ctx) => {
-      const env = await validateJJEnvironment(pi, ctx.cwd);
-      if (!env.valid) {
-        ctx.ui.notify(env.error || "Not in a jj repository", "error");
-        return;
-      }
+      ctx.ui.notify("Getting workspaces...", "info");
 
       try {
-        const workspaces = await jjWorkspaceList(pi, ctx.cwd, env.repoRoot);
+        const workspaces = await jjWorkspaceList(pi, ctx.cwd);
         if (workspaces.length === 0) {
           ctx.ui.notify("No workspaces found", "info");
           return;
