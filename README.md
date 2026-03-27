@@ -7,7 +7,7 @@ Create isolated workspaces for tasks and spawn subagents to work on them indepen
 ## Features
 
 - **LLM Tool**: `jj_workspace` - Create workspace and delegate tasks programmatically
-- **Commands**: `/jj-workspace`, `/jj-attach`, `/jj-switch`, `/jj-list`
+- **Commands**: `/jj-workspace`, `/jj-attach`, `/jj-switch`
 - **Isolated Execution**: Each task runs in a separate workspace with fresh context
 - **Lifecycle Management**: Keep, squash, or delete workspaces after completion
 - **Session Persistence**: Workspace state survives session restarts
@@ -81,14 +81,6 @@ Or without arguments to be prompted:
 
 ```
 /jj-workspace
-```
-
-### Command: `/jj-list`
-
-List all workspaces in the repository:
-
-```
-/jj-list
 ```
 
 ### Command: `/jj-attach`
@@ -260,7 +252,7 @@ Initialize a jj repo with `jj git init` or `jj init`
 
 ### Workspace creation fails
 
-- Check if a workspace with that name already exists: `/jj-list`
+- Check if a workspace with that name already exists via `/jj-switch`
 - Check if the target path already exists
 - Ensure you have write permissions to the parent directory
 

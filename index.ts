@@ -685,40 +685,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Register /jj-list command to show workspaces
-  pi.registerCommand("jj-list", {
-    description: "List jj workspaces in the current repository",
-    handler: async (_args, ctx) => {
-      const env = await validateJJEnvironment(pi, ctx.cwd);
-      if (!env.valid) {
-        ctx.ui.notify(env.error || "Not in a jj repository", "error");
-        return;
-      }
-
-      try {
-        const workspaces = await jjWorkspaceList(pi, ctx.cwd);
-        if (workspaces.length === 0) {
-          ctx.ui.notify("No workspaces found", "info");
-          return;
-        }
-
-        // Show interactive fuzzy finder
-        const selected = await showWorkspaceSelector(ctx, workspaces, "JJ Workspaces");
-
-        if (selected) {
-          // Show details about the selected workspace
-          const currentTag = selected.isCurrent ? " (current)" : "";
-          ctx.ui.notify(
-            `Workspace: ${selected.name}${currentTag}\nPath: ${selected.path}`,
-            "info"
-          );
-        }
-      } catch (err) {
-        ctx.ui.notify(`Failed to list workspaces: ${err}`, "error");
-      }
-    },
-  });
-
   // Register /jj-switch command to switch to another workspace
   pi.registerCommand("jj-switch", {
     description: "Switch to another jj workspace and start a pi session there",
